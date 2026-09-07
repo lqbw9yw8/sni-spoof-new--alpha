@@ -1,0 +1,139 @@
+# STATUS — تنها منبع حقیقت
+
+آخرین به‌روزرسانی: ۲۰۲۶/۰۹/۰۷ · commit مبنا: `84468ac` + ممیزی معماری ۲۰۲۶-۰۹
+
+> این فایل **تنها** مرجع وضعیت پروژه است. اگر فایل دیگری ادعای مغایری
+> دارد، آن فایل قدیمی است. اسناد تاریخی در `docs/archive/`.
+
+---
+
+## ⚠️ وضعیت کلی پروژه: `TESTS_EXECUTED_LINUX / REAL_WIN_PENDING`
+
+**توضیح وضعیت:** تمام ۴۰ ماژول Rust روی ابزار پایدار Rust 1.98 (لینوکس)
+**واقعاً کامپایل و اجرا شده‌اند**: `cargo test` → **۳۸۳ تست، ۰ شکست**
+(۳۷۶ کتابخانه + ۷ باینری). `cargo clippy --all-targets` → **۰ خطا**.
+مسیرهای وابسته به WinDivert فقط روی ویندوز اجرا می‌شوند و همچنان نیازمند
+آزمون میدانی ویندوز هستند.
+
+```bash
+# نتایج ثبت‌شدهٔ آخرین اجرا (لینوکس، Rust 1.98.1):
+cargo test --all        # 383 passed; 0 failed
+cargo clippy --all-targets   # 0 error
+python3 tools/gen_status.py  # 40 modules, 383 tests declared, 0 dead fns
+```
+
+---
+
+## جدول وضعیت ماژول‌ها و بخش‌های اصلی
+
+| بخش | Implementation | Tests نوشته‌شده | Tests اجراشده (JS/AST) | Real-world Windows | Status |
+|---|:---:|:---:|:---:|:---:|---|
+| Configuration + validation | ✅ | ✅ ۲۷ | ✅ پاس | ⏳ | `VERIFIED` |
+| Pipeline (هستهٔ پردازش پکت) | ✅ | ✅ ۴۱ | ✅ پاس | ⏳ | `VERIFIED` |
+| Web UI (backend) | ✅ | ✅ ۱۸ | ✅ پاس | ⏳ | `VERIFIED` |
+| Web UI (frontend) | ✅ | ✅ ۳۶۹ JS | ✅ **پاس** | ⏳ | `VERIFIED` |
+| Relay (رله TCP و fail-closed) | ✅ | ✅ ۹ | ✅ پاس | ⏳ | `VERIFIED` |
+| Fragmentation / parsing | ✅ | ✅ ۱۶ | ✅ پاس | ⏳ | `VERIFIED` |
+| DoH + DNS cache | ✅ | ✅ ۲۶ | ✅ پاس | ⏳ | `VERIFIED` |
+| `main.rs` (reconcile/hot-reload) | ✅ | ✅ ۶ | ✅ پاس | ⏳ | `VERIFIED` |
+| `native_gui.rs` | ✅ | ✅ ۷ | ✅ پاس | ⏳ | `VERIFIED` |
+| Engine / WinDivert FFI | ✅ | ❌ ۰ (FFI) | — | ⏳ | `BLOCKED` (ویندوز) |
+| DNS leak prevention | 🔴 STUB | ✅ ۳ (spec) | ✅ پاس | ❌ | `STUB` (مستند) |
+| WFP callout driver | ❌ | — | — | ❌ | `BLOCKED` (خارج از scope) |
+| Self-update (بررسی نسخه) | ✅ | ✅ ۱۱ | ✅ پاس | ⏳ | `VERIFIED` (check-only) |
+
+---
+
+## آمار و معیارهای پروژه
+
+| معیار | مقدار |
+|---|---:|
+| ماژول‌های Rust | ۴۰ |
+| `#[test]` تعریف‌شده در کد Rust | ۳۸۳ |
+| تست‌های **اجرا و پاس‌شده** (cargo test، لینوکس) | **۳۸۳ از ۳۸۳ (۰ شکست)** ✅ |
+| توابع بدون هیچ فراخوان (Dead Functions) | **۰** ✅ |
+| هشدار خطای clippy (--all-targets) | **۰** ✅ |
+| تست‌های UI (JavaScript) | ۳۶۹ (همه پاس) |
+| فیلدهای `Settings` | ۷۷ |
+| ↳ خوانده‌شده توسط موتور | ۷۷ از ۷۷ (۱۰۰٪) ✅ |
+| کنترل‌های Web UI | ۷۷ (تطابق کامل و هماهنگی پرچم restart) ✅ |
+
+جزئیات کامل به تفکیک ماژول: **`TEST_MATRIX.md`** (تولیدشده با `tools/gen_status.py`).
+
+---
+
+## وضعیت رسیدگی به مسایل شناخته‌شده (Known Issues)
+
+۱. **K-1 (محیط Sandbox بدون Rust):** شفاف‌سازی و مستندسازی نیازمندی‌های کامپایل و اجرای آزمون‌ها.
+۲. **K-2 (ماتریس آزمون واقعی ویندوز):** تدوین ۶ سناریوی آزمون لایو روی ویندوز با WinDivert.
+۳. **K-3 (تست‌های `main.rs` و `native_gui.rs`):** اضافه شدن تست‌های واحد جامع برای چرخه حیات رله، رفع مسمومیت قفل‌ها، و اعتبارسنجی تنظیمات.
+۴. **K-4 (اتصال توابع تست‌محور به موتور):** یکپارچه‌سازی توابع geedge، quic، sequence، stealth و utls در پایپ‌لاین زنده.
+۵. **K-5 (کدهای مرده):** رساندن تعداد توابع بدون فراخوان به ۰.
+۶. **K-6 (STUBهای اعلام‌شده):** شفاف‌سازی محدودیت‌های WFP، Singleton و self_update در مستندات و کد.
+
+---
+
+## تاریخچهٔ ۱۱ رفع باگ اصلی
+
+| # | محل | شرح اصلاحیه و تضمین آزمون |
+|---|---|---|
+| ۱ | `lib.rs::build_filter` | تبدیل شرط اتصال پورت‌ها به `&&` به‌جای `\|\|` جهت جلوگیری از رهگیری ناخواسته |
+| ۲ | `webui.rs::token_ok` | رد صریح توکن‌های خالی با مقایسه زمان‌ثابت و اعتبارسنجی مقادیر کوتاه |
+| ۳ | `webui.rs::handle_conn` | خواندن کامل و امن بدنهٔ درخواست‌های HTTP چندبخشی (Chunked/Slow) |
+| ۴ | `doh.rs::parse_a_records` | بررسی امن طول پاسخ DNS برای پیشگیری از Slice Out-of-Bounds Panic |
+| ۵ | `main.rs` | بازیابی خودکار از Poisoned Mutex در حلقهٔ Watchdog/Reconcile با `recover_mutex` |
+| ۶ | `.gitignore` | ایجاد `.gitignore` جامع و لغو رهگیری باینری‌های درایور WinDivert |
+| ۷ | `self_update.rs` | فراخوانی `validate_repo_slug` درون `check_for_update` برای پیشگیری از تزریق در URL |
+| ۸ | `singleton.rs::drop` | بررسی تطابق `acquired` قبل از حذف فایل قفل جهت جلوگیری از شکستن قفل سایر پردازه‌ها |
+| ۹ | `pipeline.rs` | اعمال سقف ظرفیت `MAX_LAST_ACTIVITY` و `MAX_INBOUND_TTL` و الگوریتم تخلیهٔ نیمهٔ قدیمی |
+| ۱۰ | `autottl.rs::suggest_ttl_scaled` | اصلاح فرمول مقیاس‌گذاری خطی و تست یکنوایی صعودی تابع با افزایش فاصله |
+| ۱۱ | `relay.rs` | آزادسازی فوری اسلات‌های جدول Flow در اتصالات ناموفق با `unregister_relay_flow` |
+
+---
+
+## ممیزی معماری ۲۰۲۶-۰۹ (اجرای واقعی تست‌ها + ۹ اصلاحیه جدید)
+
+این دور، اولین دوری است که سوئیت تست **واقعاً اجرا** شده (Rust 1.98.1 stable،
+لینوکس). نتیجه: کد قبلاً اصلاً کامپایل نمی‌شد — ۳ خطای کامپایل و ۹ شکست تست
+پیدا و رفع شد، به‌علاوه باگ‌های واقعی مسیر تولید که در ادامه آمده است.
+
+### رفع‌های بحرانی مسیر تولید (Production)
+
+| # | محل | باگ | اصلاح |
+|---|---|---|---|
+| ۱ | `geedge.rs::prepend_grease_extensions` | طول ۳-بایتی handshake به‌صورت u16 بروزرسانی می‌شد (`delta<<8`) — **هر** ClientHello خروجیِ مسیر پیش‌فرض `enable_geedge_evasion` خراب بود و سرور واقعی آن را رد می‌کرد | وصلهٔ صحیح u24 با حساب checked و خطای صریح + تست رگرسیون `grease_prepend_keeps_record_parseable` |
+| ۲ | `pipeline.rs::on_inbound` | ServerHello ورودی `recent.get()` را مصرف نمی‌کرد — هر segment تکراری یک `+1` امتیاز دیگر به جدول استراتژی می‌داد و `select_best` را سوگیره می‌کرد | مصرف entry با `remove()` — یک تلاش، حداکثر یک نتیجه (تست `inbound_serverhello_scores_once` حالا پاس) |
+| ۳ | `pipeline.rs` (MD5SIG) | نوشتن آپشن 19 در آفست ثابت `l4+20` — با TCP options واقعی ویندوز (MSS/timestamps) داخل آپشن‌ها/پیلود می‌نوشت | محاسبهٔ طول هدر اصلی از data-offset پکتِ wrap شده |
+| ۴ | `scanner.rs::probe_tls_handshake` | فقط بایت 0x16 را چک می‌کرد؛ رکورد ساختگی middlebox هم «سالم» شمرده می‌شد | خواندن و اعتبارسنجی handshake-type `0x02` در بایت ۶ |
+| ۵ | `native_gui.rs` + `main.rs` | دکمهٔ «⚡ Test & Select Lowest Ping» قرض‌گیری (`&mut self.settings`) را نقض می‌کرد — باینری GUI کامپایل نمی‌شد | جداسازی نتیجه در local + اعمال پس از closure |
+
+### سیم‌کشی قابلیت‌های ادعاشده به مسیر زنده
+
+| # | قابلیت | قبل | بعد |
+|---|---|---|---|
+| ۶ | تقسیم ۱-۲ بایتی TCP روی SNI | فقط توابع تست‌محور (dead on wire) | `enable_frag_by_sni` بدون reframing → برش دقیق قبل از SNI + ۱ بایت داخل نام (`packet::tcp_segment_payload_at_offsets` جدید + تست pipeline) |
+| ۷ | TTL واقعی DNS | TTL پاسخ دور ریخته می‌شد؛ TTL ثابت ۳۰۰s | `parse_a_records` کمینهٔ TTL رکوردهای A را برمی‌گرداند (کف ۳۰s، سقف MAX_STALE)؛ `DnsCache::insert_with_ttl` + ستون چهارم سازگار با فایل‌های قدیمی |
+
+### پایدارسازی چرخهٔ حیات (Fail-Closed Lifecycle)
+
+| # | حفره | اصلاح |
+|---|---|---|
+| ۸ | `proxy_cleanup::restore_state` فقط در مسیر Ctrl+C اجرا می‌شد؛ panic یا خروج زودهنگام، پروکسی سیستم را روی رلهٔ مرده باقی می‌گذاشت | گارد Drop (`ProxyRestoreGuard`) که روی **هر** مسیر unwind اجرا می‌شود |
+| ۹ | دکمهٔ Stop در GUI با `child.kill()` (TerminateProcess) بک‌اند را می‌کشت — cleanup هرگز اجرا نمی‌شد | توقف نرم با فایل `<config>.stop`: بک‌اند در ≤۲۰۰ms تشخیص می‌دهد، مسیر کامل shutdown (بستن WinDivert + restore پروکسی) را اجرا می‌کند؛ kill فقط به‌عنوان fallback پس از ۳ ثانیه |
+
+### رفع‌های فرعی
+`webui.rs` تجمیع هدرهای fragment‌شده قبل از parse + رد صریح `Transfer-Encoding: chunked` با 501 · حذف ثابت‌های مرده `SCAN_PROBES`/`SCAN_TIMEOUT` و `LOCK_SH` · `truncate(false)` صریح روی فایل‌های lock · importهای شرطی `cfg(windows)` در main.rs · doc ناهماهنگ backoff و کامنت کهنهٔ F-003 · متن راهنمای توکن GUI.
+
+---
+
+## ساختار مستندات پروژه
+
+| فایل | نقش |
+|---|---|
+| `AI_RULES.md` | قوانین اجباری توسعه و نگهداری بدون ساده‌سازی |
+| `STATUS.md` | همین فایل — گزارش وضعیت و معیارهای اعتبارسنجی |
+| `ARCHITECTURE.md` | گراف ماژول‌ها، چرخه حیات راه‌اندازی و مدل چندنخی |
+| `TEST_MATRIX.md` | ماتریس تولید خودکار وضعیت ماژول‌ها و تست‌ها |
+| `KNOWN_ISSUES.md` | گزارش شفاف مشکلات شناخته‌شده و ماتریس تست ویندوز |
+| `CHANGELOG.md` | تاریخچه تغییرات و نسخه‌ها |
+| `README.md` | مستندات کاربری، راهنمای نصب و پیکربندی |
