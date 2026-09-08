@@ -460,7 +460,7 @@ fn handle_conn(
                     stream,
                     400,
                     "application/json",
-                    r#"{"ok":false,"error":"profile must be one of Stealth, ChinaGfw, RussiaDpi, Aggressive, ChinaRegional, Henan"}"#,
+                    r#"{"ok":false,"error":"profile must be one of Stealth, ChinaGfw, RussiaDpi, Aggressive, ChinaRegional, Henan, NestedCloak"}"#,
                 ),
             }
         }
@@ -691,7 +691,13 @@ fn token_ok(header: &str, expected: &str) -> bool {
 fn is_known_profile(p: &str) -> bool {
     matches!(
         p,
-        "Stealth" | "ChinaGfw" | "RussiaDpi" | "Aggressive" | "ChinaRegional" | "Henan"
+        "Stealth"
+            | "ChinaGfw"
+            | "RussiaDpi"
+            | "Aggressive"
+            | "ChinaRegional"
+            | "Henan"
+            | "NestedCloak"
     )
 }
 
@@ -964,6 +970,7 @@ mod tests {
             "Aggressive",
             "ChinaRegional",
             "Henan",
+            "NestedCloak",
         ] {
             assert!(is_known_profile(p));
         }

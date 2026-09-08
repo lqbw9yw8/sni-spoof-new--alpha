@@ -2,6 +2,7 @@
 //! [DONE], unit tested. Pure in-memory logic, no OS dependency.
 
 use dashmap::DashMap;
+use rand::Rng;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 
@@ -90,6 +91,50 @@ impl StrategyTable {
             .filter(|entry| entry.key().0 == domain)
             .map(|entry| (entry.key().1.clone(), entry.value().value()))
             .collect()
+    }
+
+    /// Per-connection rotation (2026 roadmap #4): weighted-random pick among
+    /// the candidates that already scored positively for this domain, so
+    /// consecutive connections don't all send the same shape — a fixed
+    /// shape is exactly what lets a DPI learn it. Weights are the scores
+    /// themselves, so a technique that wins twice as often is picked twice
+    /// as often. Returns `None` when nothing has won yet; the caller falls
+    /// back to deterministic selection (new domains behave as before).
+    pub fn select_rotating(&self, domain: &str, candidates: &[&str]) -> Option<String> {
+        let mut positives: Vec<(&str, i64)> = Vec::new();
+        let mut total: i64 = 0;
+        for &name in candidates {
+            let score = self.entry(domain, name).value();
+            if score > 0 {
+                positives.push((name, score));
+                total = total.saturating_add(score);
+            }
+        }
+        if positives.is_empty() || total <= 0 {
+            return None;
+        }
+        let mut r = rand::thread_rng().gen_range(0..total);
+        for (name, score) in &positives {
+            r -= score;
+            if r < 0 {
+                return Some((*name).to_string());
+            }
+        }
+        // Unreachable in practice (the weights sum to `total`); keep the
+        // last candidate as a deterministic fallback.
+        positives.last().map(|(name, _)| (*name).to_string())
+    }
+
+    /// Recency weighting for the adaptive feedback loop (2026 roadmap #6):
+    /// pull every score halfway toward zero, so history fades and the table
+    /// keeps tracking the DPI's *current* behaviour instead of last month's.
+    pub fn decay_all(&self) {
+        for entry in self.scores.iter() {
+            let v = entry.value().value();
+            if v != 0 {
+                entry.value().0.store(v / 2, Ordering::Relaxed);
+            }
+        }
     }
 
     /// Flattened `domain|technique -> score` view, used by the dashboard.
@@ -186,6 +231,25 @@ pub fn ab_test_block_type(plain_probe_ok: bool, real_sni_probe_ok: bool) -> Bloc
     }
 }
 
+/// Ordered escalation ladder for the adaptive feedback loop (2026 roadmap
+/// #6): when the configured profile has learned to *fail* on a domain, the
+/// pipeline climbs one rung instead of retrying a known-broken shape.
+/// Ordered cheap-and-safe first, heavy machinery last.
+pub const ESCALATION_LADDER: [&str; 6] = [
+    "Stealth",
+    "ChinaGfw",
+    "RussiaDpi",
+    "ChinaRegional",
+    "Henan",
+    "NestedCloak",
+];
+
+/// The next rung after `current`, if any. Unknown profiles have no rung.
+pub fn next_rung(current: &str) -> Option<&'static str> {
+    let pos = ESCALATION_LADDER.iter().position(|p| *p == current)?;
+    ESCALATION_LADDER.get(pos + 1).copied()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -231,6 +295,85 @@ mod tests {
         assert_eq!(ab_test_block_type(true, false), BlockType::SniBlock);
         assert_eq!(ab_test_block_type(false, false), BlockType::IpBlock);
         assert_eq!(ab_test_block_type(false, true), BlockType::Inconclusive);
+    }
+
+    #[test]
+    fn select_rotating_none_until_something_wins() {
+        let table = StrategyTable::new();
+        // All scores 0 (or negative): no rotation, deterministic fallback.
+        assert_eq!(table.select_rotating("d", &["a", "b"]), None);
+        table.update_score("d", "a", false);
+        table.update_score("d", "b", false);
+        assert_eq!(table.select_rotating("d", &["a", "b"]), None);
+    }
+
+    #[test]
+    fn select_rotating_only_picks_winners_and_weights_them() {
+        let table = StrategyTable::new();
+        table.update_score("d", "frag", true); // +1
+        table.update_score("d", "case", true); // +1
+        table.update_score("d", "case", false); // -2 -> -1 (loser, excluded)
+        let mut saw_frag = 0;
+        let mut saw_case = 0;
+        for _ in 0..100 {
+            match table.select_rotating("d", &["frag", "case"]).as_deref() {
+                Some("frag") => saw_frag += 1,
+                Some("case") => saw_case += 1,
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+        // "case" is negative -> never picked; "frag" is the only winner.
+        assert_eq!(saw_frag, 100);
+        assert_eq!(saw_case, 0);
+    }
+
+    #[test]
+    fn select_rotating_explores_both_winners() {
+        let table = StrategyTable::new();
+        table.update_score("d", "a", true);
+        table.update_score("d", "b", true);
+        let mut saw_a = false;
+        let mut saw_b = false;
+        for _ in 0..200 {
+            match table.select_rotating("d", &["a", "b"]).as_deref() {
+                Some("a") => saw_a = true,
+                Some("b") => saw_b = true,
+                _ => {}
+            }
+        }
+        // Equal weights: each is picked ~50%; missing one in 200 tries is
+        // ~2^-200.
+        assert!(saw_a && saw_b);
+    }
+
+    #[test]
+    fn decay_all_halves_scores_toward_zero() {
+        let table = StrategyTable::new();
+        table.update_score("d", "t", true);
+        table.update_score("d", "t", true);
+        table.update_score("d", "t", true); // +3
+        table.update_score("d", "u", false); // -2
+        table.decay_all();
+        let scores: std::collections::HashMap<_, _> =
+            table.per_domain_scores("d").into_iter().collect();
+        assert_eq!(scores["t"], 1); // 3 / 2
+        assert_eq!(scores["u"], -1); // -2 / 2
+        table.decay_all();
+        let scores: std::collections::HashMap<_, _> =
+            table.per_domain_scores("d").into_iter().collect();
+        assert_eq!(scores["t"], 0);
+        assert_eq!(scores["u"], 0);
+    }
+
+    #[test]
+    fn escalation_ladder_climbs_in_order() {
+        assert_eq!(next_rung("Stealth"), Some("ChinaGfw"));
+        assert_eq!(next_rung("ChinaGfw"), Some("RussiaDpi"));
+        assert_eq!(next_rung("ChinaRegional"), Some("Henan"));
+        assert_eq!(next_rung("Henan"), Some("NestedCloak"));
+        assert_eq!(next_rung("NestedCloak"), None); // top of the ladder
+        assert_eq!(next_rung("Aggressive"), None); // not on the ladder
+        assert_eq!(next_rung("Nope"), None);
     }
 
     #[test]

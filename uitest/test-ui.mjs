@@ -103,7 +103,7 @@ const click = (doc, id) => doc.getElementById(id).dispatchEvent(
 
 console.log("\n[1] schema coverage against src/config.rs");
 const realFields = settingsFieldNames();
-eq("Settings field count parsed from config.rs", realFields.length, 77);
+eq("Settings field count parsed from config.rs", realFields.length, 82);
 
 {
   const dom = await makeDom();
@@ -121,7 +121,7 @@ eq("Settings field count parsed from config.rs", realFields.length, 77);
   }
   eq("controls rendered for every field", missingCtl, []);
   eq("all controls are form elements", wrongType, []);
-  eq("total field rows rendered", doc.querySelectorAll('.row[data-k]').length, 77);
+  eq("total field rows rendered", doc.querySelectorAll('.row[data-k]').length, 82);
 
   console.log("\n[3] no stale keys in the schema (would hit deny_unknown_fields)");
   const uiKeys = [...doc.querySelectorAll('.row[data-k]')].map((r) => r.dataset.k).sort();
@@ -142,7 +142,7 @@ eq("Settings field count parsed from config.rs", realFields.length, 77);
   ok("status cards rendered", doc.querySelectorAll("#cards .card").length >= 10,
     "got " + doc.querySelectorAll("#cards .card").length);
   ok("strategy scores rendered", doc.querySelectorAll("#scores tr").length >= 3);
-  ok("profile buttons rendered", doc.querySelectorAll("#profiles button").length === 6);
+  ok("profile buttons rendered", doc.querySelectorAll("#profiles button").length === 7);
 
   console.log("\n[6] editing marks the row dirty and enables Save");
   ok("Save disabled when clean", doc.getElementById("btn_save").disabled === true);
@@ -304,7 +304,7 @@ eq("Settings field count parsed from config.rs", realFields.length, 77);
   doc.getElementById("q").dispatchEvent(new dom.window.Event("input", { bubbles: true }));
   await settle(20);
   eq("clearing the search shows all rows again",
-    [...doc.querySelectorAll('.row[data-k]')].filter((r) => !r.classList.contains("hide")).length, 77);
+    [...doc.querySelectorAll('.row[data-k]')].filter((r) => !r.classList.contains("hide")).length, 82);
 
   console.log("\n[16] mutation-profile shortcut posts /api/profile");
   const pbtn = [...doc.querySelectorAll("#profiles button")].find((b) => b.dataset.p === "Henan");
@@ -364,7 +364,7 @@ eq("Settings field count parsed from config.rs", realFields.length, 77);
   ok("export triggered a download", clicked === "dpi_guard_ui_settings.json");
   const json = JSON.parse(await exported.text());
   const exportedKeys = Object.keys(json).sort();
-  eq("export covers every non-secret field", exportedKeys.length, 75);
+  eq("export covers every non-secret field", exportedKeys.length, 80);
   ok("export omits secrets", !("web_ui_token" in json) && !("win_divert_sha256" in json));
 
   dom.window.close();

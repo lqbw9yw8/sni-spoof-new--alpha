@@ -10,6 +10,12 @@
 //! - Layered domain fronting (benign SNI + hidden real in 0xFF01)
 //! - Combined TCP+TLS fragmentation for Henan-like regional firewalls
 //! - ALL PORTS: works on any TCP/UDP port via intercept_ports config, not just 443
+//! 2026 roadmap:
+//! - NestedCloak profile: cover SNI + real name in 0xFF01, mandatory
+//!   3-segment TCP split + disorder
+//! - frag_mid_sni: TLS-record cut inside the SNI name
+//! - Random padding inflation, always-on ECH-GREASE (0xFE0D), real ECH
+//!   sealing (hpke.rs), per-connection strategy rotation + escalation
 
 use crate::config::Settings;
 use crate::connection::SessionTicketCache;
@@ -114,6 +120,12 @@ pub struct Pipeline {
     /// ServerHello feedback in `on_inbound` can score that mode too and
     /// `enable_adaptive_desync` actually learns. Keyed like `recent`.
     last_desync: HashMap<(IpAddr, u16), String>,
+    /// Parsed real-ECH config (from `real_ech_config_hex`), when valid.
+    /// `None` = real ECH off or config missing/broken (fail-open).
+    ech_config: Option<crate::ech::EchConfigDetailed>,
+    /// Counts RST/ServerHello feedback events; drives strategy score decay
+    /// when `enable_strategy_rotation` is on (2026 roadmap #6).
+    feedback_ticks: u64,
 }
 
 fn release_held_plus(mut held: Vec<Vec<u8>>, current: &[u8]) -> WireAction {
@@ -123,6 +135,30 @@ fn release_held_plus(mut held: Vec<Vec<u8>>, current: &[u8]) -> WireAction {
 
 impl Pipeline {
     pub fn new(settings: Settings) -> Self {
+        // Parse the real-ECH config once at construction (validate() already
+        // checked it at load; re-parse defensively for hot-reload paths).
+        let ech_config = if settings.enable_real_ech {
+            match crate::hpke::decode_hex(&settings.real_ech_config_hex)
+                .ok()
+                .map(|bytes| crate::ech::parse_ech_config_detailed(&bytes))
+            {
+                Some(Ok(cfg)) => {
+                    log::info!(
+                        "real ECH configured: public_name {}",
+                        cfg.public_name
+                    );
+                    Some(cfg)
+                }
+                _ => {
+                    log::warn!(
+                        "enable_real_ech is set but real_ech_config_hex is missing/invalid; real ECH disabled"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
         Self {
             settings,
             strategy: StrategyTable::new(),
@@ -137,6 +173,22 @@ impl Pipeline {
             autottl: crate::autottl::AutoTtl::new(),
             inbound_ttl: HashMap::new(),
             last_desync: HashMap::new(),
+            ech_config,
+            feedback_ticks: 0,
+        }
+    }
+
+    /// One RST/ServerHello feedback event landed. With strategy rotation on
+    /// (2026 roadmap #6), decay all scores every 32 events so the adaptive
+    /// loop keeps tracking the DPI's *current* behaviour.
+    fn feedback_tick(&mut self) {
+        if !self.settings.enable_strategy_rotation {
+            return;
+        }
+        self.feedback_ticks += 1;
+        if self.feedback_ticks % 32 == 0 {
+            self.strategy.decay_all();
+            log::debug!("strategy scores decayed (strategy rotation on)");
         }
     }
 
@@ -628,6 +680,7 @@ impl Pipeline {
                     recent.technique
                 );
             }
+            self.feedback_tick();
             return;
         }
         let payload = parsed.payload(raw);
@@ -661,6 +714,7 @@ impl Pipeline {
                 self.strategy
                     .update_score(&recent.domain, &recent.technique, true);
             }
+            self.feedback_tick();
         }
     }
 
@@ -911,6 +965,7 @@ impl Pipeline {
             MutationProfile::Aggressive.as_str(),
             MutationProfile::ChinaRegional.as_str(),
             MutationProfile::Henan.as_str(),
+            MutationProfile::NestedCloak.as_str(),
         ];
         let chosen = self
             .strategy
@@ -934,10 +989,28 @@ impl Pipeline {
             .find(|(n, _)| n == &chosen)
             .map(|(_, s)| s)
             .unwrap_or(0);
-        let profile_name = if chosen_score > cfg_score {
+        let deterministic = if chosen_score > cfg_score {
             chosen
         } else {
             self.settings.mutation_profile.clone()
+        };
+        // 2026 roadmap #4 + #6 — per-connection strategy rotation: instead
+        // of always sending the single best shape (which a DPI can learn),
+        // rotate weighted-random among the techniques that already won for
+        // this domain; when the configured profile has learned to FAIL,
+        // climb the escalation ladder instead of retrying it.
+        let profile_name = if self.settings.enable_strategy_rotation {
+            if cfg_score < 0 {
+                crate::strategy::next_rung(&self.settings.mutation_profile)
+                    .map(str::to_string)
+                    .unwrap_or(deterministic)
+            } else {
+                self.strategy
+                    .select_rotating(&domain, &candidates)
+                    .unwrap_or(deterministic)
+            }
+        } else {
+            deterministic
         };
         let profile: MutationProfile = profile_name.parse().unwrap_or(MutationProfile::Stealth);
 
@@ -961,8 +1034,54 @@ impl Pipeline {
             tls_record.to_vec()
         };
 
-        // --- NEW 2025: SNI fronting + disguise (layered) ---
-        if !self.settings.fronting_benign_sni.is_empty() {
+        // --- SNI fronting + disguise (layered), or Nested Extension Cloaking ---
+        let mut nested_active = false;
+        // Hot-reload may have turned enable_real_ech on after this Pipeline
+        // was constructed; (re)parse the config lazily instead of silently
+        // skipping the seal forever.
+        if self.settings.enable_real_ech && self.ech_config.is_none() {
+            self.ech_config = crate::hpke::decode_hex(&self.settings.real_ech_config_hex)
+                .ok()
+                .and_then(|bytes| crate::ech::parse_ech_config_detailed(&bytes).ok());
+            if self.ech_config.is_none() {
+                log::warn!("real ECH enabled but real_ech_config_hex is unusable; continuing without ECH");
+            }
+        }
+        // Real ECH (when configured) is strictly stronger than cloaking — the
+        // name disappears from the wire entirely — and layering the 0xFF01
+        // hidden extension under a seal would leak it in the outer hello.
+        let real_ech_armed = self.settings.enable_real_ech && self.ech_config.is_some();
+        if profile == MutationProfile::NestedCloak && !real_ech_armed {
+            // 2026 NestedCloak: the visible SNI becomes a benign cover and
+            // the untouched real name rides inside a private-range
+            // extension (0xFF01). The 3-segment TCP split at the hidden
+            // extension boundary happens below, on the final record.
+            let cover = if self.settings.fronting_benign_sni.is_empty() {
+                crate::sni_mutations::random_nested_cover()
+            } else {
+                self.settings.fronting_benign_sni.clone()
+            };
+            match fragmentation::nested_cloak(
+                &hello,
+                cover.as_bytes(),
+                sni,
+                crate::sni_mutations::NESTED_HIDDEN_EXT_TYPE,
+            ) {
+                Ok(cloaked) => {
+                    hello = cloaked;
+                    nested_active = true;
+                    log::info!(
+                        "NestedCloak: cover {}, real name hidden in 0x{:04X}",
+                        cover,
+                        crate::sni_mutations::NESTED_HIDDEN_EXT_TYPE
+                    );
+                }
+                Err(e) => log::warn!("NestedCloak unavailable ({e}); sending hello as-is"),
+            }
+        } else if !self.settings.fronting_benign_sni.is_empty() && !real_ech_armed {
+            // Real ECH subsumes fronting entirely (outer SNI = ECH
+            // public_name, inner = real name); fronting first would only
+            // leave a stale cover/disguised extension behind.
             let benign = self.settings.fronting_benign_sni.as_bytes();
             if let Ok(fronted) = fragmentation::front_sni_with_benign(&hello, benign) {
                 if self.settings.enable_sni_disguise {
@@ -981,7 +1100,7 @@ impl Pipeline {
                     hello = fronted;
                 }
             }
-        } else if self.settings.enable_sni_disguise {
+        } else if self.settings.enable_sni_disguise && !real_ech_armed {
             let disguise_type = crate::sni_mutations::random_disguise_type();
             if let Ok(disguised) = fragmentation::disguise_sni_extension_type(&hello, disguise_type)
             {
@@ -993,20 +1112,38 @@ impl Pipeline {
             }
         }
 
-        // ECH GREASE (2025)
-        if self.settings.enable_ech_grease {
+        // ECH GREASE (2025) — upgraded to always-on 0xFE0D (2026 roadmap
+        // #3): attach the *real* ECH extension type with a random payload
+        // to every hello so "has ECH / no ECH" classification is useless.
+        // Servers that don't implement ECH ignore the extension. Skipped
+        // when real ECH below attaches the real thing anyway (but stays on
+        // when the real-ECH config is unusable and the seal will be skipped).
+        if self.settings.enable_ech_grease && !real_ech_armed {
             if !self.settings.fronting_benign_sni.is_empty() {
                 let _ =
                     crate::ech::build_outer_sni_for_ech(&hello, &self.settings.fronting_benign_sni);
             }
-            if let Ok(with_ech_grease) = crate::ech::inject_ech_grease_ext(&hello) {
-                hello = with_ech_grease;
-                log::debug!("ECH GREASE injected");
+            let has_ech = crate::fragmentation::list_extensions(&hello)
+                .map(|exts| {
+                    exts.iter()
+                        .any(|e| e.ext_type == crate::ech::ECH_EXTENSION_TYPE)
+                })
+                .unwrap_or(true); // parse failure: don't add anything
+            if has_ech {
+                log::debug!("ECH extension already present; skipping GREASE");
+            } else if let Ok(with_ech) = crate::ech::inject_ech_grease_fe0d(&hello) {
+                hello = with_ech;
+                log::debug!("ECH GREASE injected (type 0xFE0D)");
+            } else if let Ok(with_grease) = crate::ech::inject_ech_grease_ext(&hello) {
+                hello = with_grease;
+                log::debug!("ECH GREASE injected (GREASE type)");
             }
         }
 
-        // uTLS fingerprint rotation (JA3/JA4) - based on utls
-        if self.settings.enable_utls_fingerprint {
+        // uTLS fingerprint rotation (JA3/JA4) - based on utls. Skipped when
+        // real ECH is on: the cipher-suite shuffle must not run after the
+        // seal (it would invalidate the AAD) and is pointless inside it.
+        if self.settings.enable_utls_fingerprint && !self.settings.enable_real_ech {
             let _ = crate::fragmentation::shuffle_cipher_suites_in_hello(&mut hello);
             if let Err(e) =
                 crate::utls::apply_fingerprint_to_hello(&mut hello, &self.settings.utls_browser)
@@ -1019,7 +1156,9 @@ impl Pipeline {
         // a random-length padding extension (0x0015). Both confuse naive
         // offset-based SNI scanners without breaking a standards-compliant
         // server (unknown ext types are ignored per RFC 8446 §4.1.2).
-        if self.settings.enable_geedge_evasion {
+        // Skipped when real ECH is on: the fake-record prepend breaks the
+        // seal's parse and the rest is meaningless once the name is sealed.
+        if self.settings.enable_geedge_evasion && !self.settings.enable_real_ech {
             if matches!(
                 self.settings.mutation_profile.as_str(),
                 "ChinaRegional" | "Henan"
@@ -1039,6 +1178,59 @@ impl Pipeline {
                 if let Ok(padded) = crate::geedge::add_tls_padding_extension(&hello, pad) {
                     hello = padded;
                 }
+            }
+        }
+
+        // Padding inflation (2026 roadmap #2): a random-length RFC 7685
+        // padding extension per connection. Runs after the geedge block so
+        // its random size stacks on top of the GREASE shifts; it appends at
+        // the end of the extension list, so NestedCloak offsets below stay
+        // valid. Skipped when real ECH seals the hello: the padding would
+        // land inside the sealed outer and the AAD must see the final bytes.
+        if self.settings.enable_padding_inflation && !self.settings.enable_real_ech {
+            if let Ok(padded) = crate::geedge::inflate_padding_random(&hello, 64, 384) {
+                hello = padded;
+            }
+        }
+
+        // Real ECH (2026 roadmap #5) — MUST stay the last hello mutation:
+        // the AEAD's AAD (RFC 9849 §5.2) is the entire outer ClientHello
+        // with the payload zeroed, so anything that still rewrites the
+        // outer after sealing would break decryption on the server. The
+        // outer SNI becomes the ECHConfig's public_name; the real name
+        // exists only inside the HPKE-sealed payload.
+        if self.settings.enable_real_ech {
+            if let Some(cfg) = self.ech_config.as_ref() {
+                match crate::ech::seal_real_ech_hello(&hello, sni, cfg, None) {
+                    Ok(sealed) => {
+                        log::info!("real ECH applied: outer SNI {}", cfg.public_name);
+                        hello = sealed;
+                    }
+                    Err(e) => {
+                        log::warn!("real ECH seal failed ({e}); continuing without ECH")
+                    }
+                }
+            }
+        }
+
+        // NestedCloak: compute the 3-segment TCP split points on the FINAL
+        // record. Anything above that changes lengths (geedge prepends,
+        // padding, ECH) may shift the hidden extension, so the offsets are
+        // derived here, not at cloaking time.
+        let mut nested_offsets: Option<Vec<usize>> = None;
+        if nested_active {
+            match fragmentation::nested_cloak_split_offsets(
+                &hello,
+                crate::sni_mutations::NESTED_HIDDEN_EXT_TYPE,
+            ) {
+                Ok(offsets) => {
+                    log::debug!(
+                        "NestedCloak split at offsets {offsets:?} (payload {} bytes)",
+                        hello.len()
+                    );
+                    nested_offsets = Some(offsets);
+                }
+                Err(e) => log::warn!("NestedCloak split points unavailable ({e})"),
             }
         }
 
@@ -1107,13 +1299,22 @@ impl Pipeline {
             }
         }
 
-        // Combined TCP+TLS fragmentation for Henan / regional firewalls
+        // Combined TCP+TLS fragmentation for Henan / regional firewalls.
+        // NestedCloak *requires* combined fragmentation even if the
+        // operator disabled the flag — the cross-segment split is its
+        // whole evasion story.
+        let combined_on = self.settings.enable_combined_fragmentation
+            || profile.requires_combined_fragmentation();
         let mut effective_chunk = self.settings.fragment_chunk_size;
-        if self.settings.enable_combined_fragmentation {
+        if combined_on {
             let recommended = profile.recommended_fragment_size();
             if recommended != 0 && (effective_chunk == 0 || recommended < effective_chunk) {
                 effective_chunk = recommended;
             }
+        }
+        if profile == MutationProfile::NestedCloak {
+            // Chunk derived from the real name: min(32, len(SNI)).
+            effective_chunk = crate::sni_mutations::nested_chunk_size(sni.len());
         }
         // enable_adaptive_desync: choose the desync mode for this domain from
         // the learned strategy scores instead of relying on the fixed flags
@@ -1137,11 +1338,15 @@ impl Pipeline {
             log::debug!("adaptive desync for {domain:?}: {}", m.as_str());
         }
         let use_tls_record_frag = self.settings.enable_tls_record_fragmentation
+            || self.settings.enable_frag_mid_sni
             || adaptive == Some(crate::strategy::DesyncMode::TlsRecordFrag);
         let use_frag_by_sni = self.settings.enable_frag_by_sni
             || adaptive == Some(crate::strategy::DesyncMode::FragBySni);
+        // 2026 roadmap #1: cut the TLS record *inside* the SNI name so no
+        // single record contains the full hostname.
+        let use_frag_mid_sni = self.settings.enable_frag_mid_sni;
         let should_disorder = profile.uses_disorder()
-            || self.settings.enable_combined_fragmentation
+            || combined_on
             || adaptive == Some(crate::strategy::DesyncMode::Disorder);
 
         // enable_tls_record_fragmentation / tls_record_chunk_size /
@@ -1178,6 +1383,8 @@ impl Pipeline {
                     Vec::new()
                 } else if use_frag_by_sni {
                     fragmentation::tls_record_split_before_sni(pl).unwrap_or_default()
+                } else if use_frag_mid_sni {
+                    fragmentation::tls_record_split_mid_sni(pl).unwrap_or_default()
                 } else {
                     // fragment_as_tls_records takes the handshake *body*;
                     // strip the 5-byte record header it re-adds per chunk.
@@ -1204,7 +1411,7 @@ impl Pipeline {
 
         if !reframed.is_empty() {
             packets.extend(reframed);
-        } else if self.settings.enable_sni_fragmentation {
+        } else if self.settings.enable_sni_fragmentation || nested_offsets.is_some() {
             // enable_frag_by_sni (TCP-level, without TLS-record reframing):
             // cut the wire exactly before the SNI and again 1 byte into the
             // name — the classic GoodbyeDPI/zapret "1-byte split at the SNI"
@@ -1220,7 +1427,17 @@ impl Pipeline {
                 } else {
                     None
                 };
-            let seg_res = if let Some(offsets) = sni_split_offsets {
+            let seg_res = if let Some(offsets) = nested_offsets.take() {
+                // NestedCloak 3-segment split: cover hello / hidden-ext
+                // header + name prefix / name tail. A non-reassembling DPI
+                // only ever sees segment 1.
+                log::debug!(
+                    "NestedCloak TCP split at offsets {:?} (payload {} bytes)",
+                    offsets,
+                    hello.len()
+                );
+                packet::tcp_segment_payload_at_offsets(&real, &offsets)
+            } else if let Some(offsets) = sni_split_offsets {
                 log::debug!(
                     "TCP 1-byte SNI split at offsets {:?} (payload {} bytes)",
                     offsets,
@@ -1241,9 +1458,7 @@ impl Pipeline {
                     } else {
                         segs
                     };
-                    if profile == MutationProfile::Henan
-                        && self.settings.enable_combined_fragmentation
-                    {
+                    if profile == MutationProfile::Henan && combined_on {
                         let mut combined = Vec::new();
                         for seg in segs {
                             if let Some(p) = packet::parse_l3l4(&seg) {
@@ -2548,6 +2763,129 @@ mod tests {
         let (s, e) = fragmentation::calculate_smart_split_points(payload).unwrap();
         assert_eq!(&payload[s..e], b"www.microsoft.com");
         assert!(payload.windows(16).any(|w| w == b"real.example.com"));
+    }
+
+    #[test]
+    fn nested_cloak_profile_produces_three_segments() {
+        let pkt = ch_pkt("secret.example.com");
+        let mut p = Pipeline::new(Settings {
+            mutation_profile: "NestedCloak".into(),
+            enable_decoys: false,
+            enable_sni_fragmentation: true,
+            enable_combined_fragmentation: true,
+            enable_geedge_evasion: false,
+            fronting_benign_sni: "www.microsoft.com".into(),
+            ..Settings::default()
+        });
+        let WireAction::Send(pkts) = p.handle(&pkt).unwrap() else {
+            panic!()
+        };
+        assert_eq!(pkts.len(), 3, "NestedCloak must emit exactly 3 TCP segments");
+        // Reassemble by TCP sequence number and inspect the full record.
+        let mut parts: Vec<(u32, Vec<u8>)> = pkts
+            .iter()
+            .map(|pkt| {
+                let parsed = packet::parse_l3l4(pkt).unwrap();
+                (parsed.tcp_seq.unwrap_or(0), parsed.payload(pkt).to_vec())
+            })
+            .collect();
+        parts.sort_by_key(|(seq, _)| *seq);
+        let joined: Vec<u8> = parts.iter().flat_map(|(_, pl)| pl.iter().copied()).collect();
+        // Cover SNI is the visible 0x0000 name.
+        let (s, e) = fragmentation::calculate_smart_split_points(&joined).unwrap();
+        assert_eq!(&joined[s..e], b"www.microsoft.com");
+        // Real name rides inside the private-range extension.
+        let exts = fragmentation::list_extensions(&joined).unwrap();
+        let hidden = exts.iter().find(|x| x.ext_type == 0xFF01).unwrap();
+        assert_eq!(&joined[hidden.body_start..hidden.body_end], b"secret.example.com");
+        // No single segment may contain the whole real name.
+        for (_, pl) in &parts {
+            assert!(!pl.windows(18).any(|w| w == b"secret.example.com"));
+        }
+    }
+
+    #[test]
+    fn nested_cloak_enforces_combined_fragmentation_when_disabled() {
+        let pkt = ch_pkt("secret.example.com");
+        let mut p = Pipeline::new(Settings {
+            mutation_profile: "NestedCloak".into(),
+            enable_decoys: false,
+            enable_sni_fragmentation: true,
+            enable_combined_fragmentation: false, // profile must override this
+            enable_geedge_evasion: false,
+            ..Settings::default()
+        });
+        let WireAction::Send(pkts) = p.handle(&pkt).unwrap() else {
+            panic!()
+        };
+        // Still the 3-segment split (the profile mandates combined frag).
+        assert_eq!(pkts.len(), 3);
+    }
+
+    #[test]
+    fn frag_mid_sni_pipeline_straddles_the_name() {
+        let pkt = ch_pkt("example.com");
+        let mut p = Pipeline::new(Settings {
+            mutation_profile: "Stealth".into(),
+            enable_decoys: false,
+            enable_sni_fragmentation: false,
+            enable_combined_fragmentation: false,
+            enable_geedge_evasion: false,
+            enable_frag_mid_sni: true,
+            ..Settings::default()
+        });
+        let WireAction::Send(pkts) = p.handle(&pkt).unwrap() else {
+            panic!()
+        };
+        assert_eq!(pkts.len(), 2, "mid-SNI split produces two TLS records");
+        for pkt in &pkts {
+            let parsed = packet::parse_l3l4(pkt).unwrap();
+            let pl = parsed.payload(pkt);
+            assert_eq!(pl[0], 0x16, "each piece is a handshake record");
+            assert!(!pl.windows(11).any(|w| w == b"example.com"));
+        }
+        // Reassembled (by seq) the full name is back; the Stealth profile
+        // may case-mutate it, so compare case-insensitively.
+        let mut parts: Vec<(u32, Vec<u8>)> = pkts
+            .iter()
+            .map(|pkt| {
+                let parsed = packet::parse_l3l4(pkt).unwrap();
+                (parsed.tcp_seq.unwrap_or(0), parsed.payload(pkt).to_vec())
+            })
+            .collect();
+        parts.sort_by_key(|(seq, _)| *seq);
+        let mut rejoined: Vec<u8> = Vec::new();
+        for (_, pl) in &parts {
+            rejoined.extend_from_slice(&pl[5..]); // strip per-record header
+        }
+        let mut record = vec![0x16, 0x03, 0x01];
+        record.extend_from_slice(&((rejoined.len()) as u16).to_be_bytes());
+        record.extend_from_slice(&rejoined);
+        let (s, e) = fragmentation::calculate_smart_split_points(&record).unwrap();
+        let name = String::from_utf8_lossy(&record[s..e]).to_lowercase();
+        assert_eq!(name, "example.com");
+    }
+
+    #[test]
+    fn padding_inflation_grows_the_hello_randomly() {
+        let base = fragmentation::encode_client_hello("example.com").len();
+        let pkt = ch_pkt("example.com");
+        let mut p = Pipeline::new(Settings {
+            mutation_profile: "Stealth".into(),
+            enable_decoys: false,
+            enable_sni_fragmentation: false,
+            enable_geedge_evasion: false,
+            enable_padding_inflation: true,
+            ..Settings::default()
+        });
+        let WireAction::Send(pkts) = p.handle(&pkt).unwrap() else {
+            panic!()
+        };
+        assert_eq!(pkts.len(), 1);
+        let parsed = packet::parse_l3l4(&pkts[0]).unwrap();
+        let delta = parsed.payload(&pkts[0]).len() - base;
+        // 4-byte extension header + random body in [64, 384].
+        assert!((68..=388).contains(&delta), "delta {delta}");
     }
 
     #[test]

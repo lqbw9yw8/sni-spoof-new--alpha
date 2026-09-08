@@ -395,8 +395,8 @@ const SECTIONS = [
 const FIELDS = [
   // ---- core ----
   { k: "mutation_profile", s: "core", t: "enum", lbl: "پروفایل جهش",
-    opts: ["Stealth", "ChinaGfw", "RussiaDpi", "Aggressive", "ChinaRegional", "Henan"],
-    help: "مجموعهٔ تکنیک‌های جهش SNI. از دکمه‌های تب «نمای کلی» هم قابل تغییر است." },
+    opts: ["Stealth", "ChinaGfw", "RussiaDpi", "Aggressive", "ChinaRegional", "Henan", "NestedCloak"],
+    help: "مجموعهٔ تکنیک‌های جهش SNI. از دکمه‌های تب «نمای کلی» هم قابل تغییر است. NestedCloak = پوشش تو در تو: SNI پوششی + نام واقعی در افزونهٔ خصوصی + تقسیم ۳ بخشی TCP." },
   { k: "decoy_ttl", s: "core", t: "int", lbl: "TTL پکت جعلی",
     min: 1, max: 64, help: "باید آن‌قدر کم باشد که قبل از رسیدن به سرور واقعی بمیرد، ولی به DPI برسد. تعداد هاپ تا DPI را با tracert اندازه بگیرید." },
   { k: "idle_timeout_secs", s: "core", t: "int", lbl: "تایم‌اوت بی‌کاری جریان (ثانیه)",
@@ -451,6 +451,8 @@ const FIELDS = [
     help: "۰ = استفاده از اندازهٔ تکهٔ تکه‌سازی. حداکثر ۱۶۳۸۴ (یک رکورد TLS)." },
   { k: "enable_frag_by_sni", s: "tls", t: "bool", lbl: "برش دقیقاً قبل از SNI",
     help: "مرز رکورد TLS را دقیقاً قبل از نام SNI می‌گذارد تا DPI نتواند آن را بخواند." },
+  { k: "enable_frag_mid_sni", s: "tls", t: "bool", lbl: "برش وسطِ نام SNI",
+    help: "رکورد TLS را وسط نام SNI می‌شکند تا نام بین دو رکورد پاره شود؛ هیچ رکوردی به‌تنهایی نام کامل را ندارد." },
   { k: "autottl_scale_a1", s: "tls", t: "int", lbl: "AutoTTL مقیاس a1",
     min: 0, max: 64, help: "کران پایین TTL مقیاس‌شده. ۰ = استفاده از تعداد هاپ یادگرفته‌شده بدون تغییر." },
   { k: "autottl_scale_a2", s: "tls", t: "int", lbl: "AutoTTL مقیاس a2",
@@ -468,7 +470,14 @@ const FIELDS = [
   { k: "utls_browser", s: "fp", t: "enum", lbl: "مرورگر جعل‌شده",
     opts: ["chrome", "firefox", "safari", "edge", "random"], help: "قالب اثر انگشت + GREASE." },
   { k: "enable_ech_grease", s: "fp", t: "bool", lbl: "ECH GREASE",
-    help: "اکستنشن Encrypted Client Hello را به‌صورت GREASE، کنار SNI بیرونی اضافه می‌کند." },
+    help: "اکستنشن Encrypted Client Hello را با نوع واقعی 0xFE0D و payload تصادفی به هر هللو اضافه می‌کند تا دسته‌بندی «ECH دارد/ندارد» بی‌اثر شود." },
+  { k: "enable_real_ech", s: "fp", t: "bool", lbl: "ECH واقعی",
+    help: "SNI واقعی را داخل یک ClientHello داخلی با HPKE (X25519 + ChaCha20Poly1305) مهر می‌کند؛ بیرون فقط public_name دیده می‌شود. سرور مقصد باید ECH پشتیبانی کند." },
+  { k: "real_ech_config_hex", s: "fp", t: "str", lbl: "ECHConfig (هگز)", mono: true,
+    placeholder: "هگزِ فیلد ech از رکورد DNS HTTPS مقصد",
+    help: "مقدار بایتی «ech» در رکورد HTTPS/SVCB دامنهٔ مقصد (مثلاً با dig). فقط وقتی enable_real_ech روشن است خوانده می‌شود." },
+  { k: "enable_padding_inflation", s: "fp", t: "bool", lbl: "بادکردن تصادفی اندازه (پدینگ)",
+    help: "هر اتصال یک افزونهٔ پدینگ TLS با طول تصادفی (۶۴ تا ۳۸۴ بایت) می‌گیرد تا اثر انگشت‌های اندازهٔ ثابت و استخراج‌کننده‌های آفست‌محور خراب شوند." },
   { k: "enable_md5sig_fooling", s: "fp", t: "bool", lbl: "فول MD5SIG (گزینهٔ TCP 19)", danger: true,
     help: "سبک zapret. روی بعضی سرورها اتصال را می‌شکند؛ فقط وقتی روشنش کنید که دلیلش را می‌دانید." },
   { k: "enable_geedge_evasion", s: "fp", t: "bool", lbl: "دورزدن Geedge",
@@ -565,6 +574,8 @@ const FIELDS = [
     help: "تزریق دادهٔ out-of-band — ممکن است بعضی سرورها را بشکند." },
   { k: "enable_adaptive_desync", s: "desync", t: "bool", lbl: "ناهمگام‌سازی تطبیقی",
     help: "حالت ناهمگام‌سازی را برای هر اتصال انتخاب می‌کند، نه یک حالت ثابت." },
+  { k: "enable_strategy_rotation", s: "desync", t: "bool", lbl: "چرخش استراتژی هر اتصال",
+    help: "بین تکنیک‌هایی که برای آن دامنه امتیاز مثبت دارند تصادفیِ وزن‌دار انتخاب می‌کند و اگر پروفایل پیکربندی‌شده امتیاز منفی گرفت از نردبان ارتقا بالا می‌رود؛ امتیازها هر ۳۲ رخداد بازخورد به‌سمت صفر پوسیده می‌شوند." },
   { k: "enable_hostdot", s: "desync", t: "bool", lbl: "نقطهٔ Host (zapret)",
     help: "یک نقطهٔ اضافی بعد از نام هاست در هدر HTTP Host." },
   { k: "max_payload_size", s: "desync", t: "int", lbl: "سقف اندازهٔ payload (بایت)",
@@ -591,7 +602,7 @@ const FIELDS = [
     help: "هنگام خروج، تنظیمات پروکسی سیستم را بازنشانی می‌کند. وضعیت اولیه فقط در شروع ذخیره می‌شود؛ برای اعمال‌شدن نیاز به اجرای مجدد برنامه دارد." },
 ];
 
-const PROFILES = ["Stealth", "ChinaGfw", "RussiaDpi", "Aggressive", "ChinaRegional", "Henan"];
+const PROFILES = ["Stealth", "ChinaGfw", "RussiaDpi", "Aggressive", "ChinaRegional", "Henan", "NestedCloak"];
 const LS_TOKEN = "dpi_guard_token";
 
 /* ---------------------------- utilities ---------------------------- */

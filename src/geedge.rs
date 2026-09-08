@@ -8,6 +8,7 @@
 //! This module provides Geedge-specific evasion techniques.
 
 use crate::error::DpiGuardError;
+use rand::Rng;
 
 /// SNI as IP literal (RFC 6066 says SNI must NOT be IP literal, but Geedge may skip it)
 /// Some DPI parsers check if SNI is IP and skip filtering (to avoid breaking IP-based virtual hosting)
@@ -24,6 +25,28 @@ pub fn add_tls_padding_extension(record: &[u8], pad_len: usize) -> Result<Vec<u8
     let padding = vec![0u8; pad_len];
     crate::fragmentation::inject_hidden_sni_in_unknown_ext(record, &padding, 0x0015)
         .map_err(|e| DpiGuardError::OutOfRange(format!("padding inject failed: {e}")))
+}
+
+/// Random-length padding inflation (2026 roadmap #2, RFC 7685): grow the
+/// ClientHello by a *random* amount per connection. This breaks both
+/// fixed-size ClientHello fingerprints (the classic 517-byte shape that
+/// offset-based extractors anchor on) and DPIs with small reassembly
+/// buffers. The pad is a standard TLS padding extension (type 0x0015),
+/// which a standards-compliant server ignores. `max_pad` is clamped to the
+/// same 1024-byte ceiling as [`add_tls_padding_extension`].
+pub fn inflate_padding_random(
+    record: &[u8],
+    min_pad: usize,
+    max_pad: usize,
+) -> Result<Vec<u8>, DpiGuardError> {
+    let max_pad = max_pad.min(1024);
+    if min_pad > max_pad {
+        return Err(DpiGuardError::OutOfRange(
+            "padding inflation min_pad > max_pad".into(),
+        ));
+    }
+    let pad = rand::thread_rng().gen_range(min_pad..=max_pad);
+    add_tls_padding_extension(record, pad)
 }
 
 /// Geedge assumes SNI is the first extension; putting GREASE extensions
@@ -211,6 +234,33 @@ mod tests {
         let record = encode_client_hello("example.com");
         let padded = add_tls_padding_extension(&record, 32).unwrap();
         assert!(padded.len() > record.len());
+    }
+
+    #[test]
+    fn random_padding_inflation_is_in_range_and_varies() {
+        let record = encode_client_hello("example.com");
+        let base = record.len();
+        let mut deltas = std::collections::HashSet::new();
+        for _ in 0..40 {
+            let padded = inflate_padding_random(&record, 64, 384).unwrap();
+            let delta = padded.len() - base;
+            // 4-byte extension header + pad body in [64, 384].
+            assert!(delta >= 64 + 4 && delta <= 384 + 4, "delta {delta}");
+            // Record stays structurally valid.
+            let rec_len = u16::from_be_bytes([padded[3], padded[4]]) as usize;
+            assert_eq!(5 + rec_len, padded.len());
+            deltas.insert(delta);
+        }
+        // Random length: 40 draws over a 320-wide range cannot all collide.
+        assert!(deltas.len() > 1);
+    }
+
+    #[test]
+    fn random_padding_inflation_validates_bounds() {
+        let record = encode_client_hello("example.com");
+        assert!(inflate_padding_random(&record, 500, 100).is_err());
+        // max_pad clamps to the 1024 ceiling instead of erroring.
+        assert!(inflate_padding_random(&record, 1024, 5000).is_ok());
     }
 
     #[test]

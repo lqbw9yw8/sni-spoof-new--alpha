@@ -73,6 +73,12 @@ export const DEFAULTS = {
   autottl_delta: 0,
   enable_http_host_tricks: false,
   enable_adaptive_desync: false,
+  // 2026 roadmap upgrades (NestedCloak era)
+  enable_frag_mid_sni: false,
+  enable_padding_inflation: false,
+  enable_strategy_rotation: false,
+  enable_real_ech: false,
+  real_ech_config_hex: "",
   relay_require_inject: true,
   // 25 new features defaults
   enable_sni_scanner: false,
@@ -108,7 +114,7 @@ export const DEFAULTS = {
   // trusted_dns: Option<String> — absent means None
 };
 
-const PROFILES = ["Stealth", "ChinaGfw", "RussiaDpi", "Aggressive", "ChinaRegional", "Henan"];
+const PROFILES = ["Stealth", "ChinaGfw", "RussiaDpi", "Aggressive", "ChinaRegional", "Henan", "NestedCloak"];
 const BROWSERS = ["chrome", "firefox", "safari", "edge", "random"];
 
 let settings = JSON.parse(JSON.stringify(DEFAULTS));

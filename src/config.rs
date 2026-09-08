@@ -175,6 +175,33 @@ pub struct Settings {
     /// (`strategy::DesyncMode`) instead of the fixed flags alone.
     #[serde(default)]
     pub enable_adaptive_desync: bool,
+    // --- 2026 roadmap upgrades (NestedCloak era) ---
+    /// Split the ClientHello's TLS record *inside* the SNI name (the name
+    /// straddles the record boundary) instead of before it. Roadmap #1.
+    #[serde(default)]
+    pub enable_frag_mid_sni: bool,
+    /// Inflate the ClientHello with a random-length TLS padding extension
+    /// (RFC 7685) per connection, breaking fixed-size fingerprints and
+    /// offset-based SNI extractors. Roadmap #2.
+    #[serde(default)]
+    pub enable_padding_inflation: bool,
+    /// Per-connection strategy rotation + escalation (roadmap #4 + #6):
+    /// weighted-random pick among techniques that already scored positively
+    /// for a domain, and ladder-climb when the configured profile scores
+    /// negative. Off = the previous deterministic selection.
+    #[serde(default)]
+    pub enable_strategy_rotation: bool,
+    /// Real ECH (roadmap #5): seal the real SNI inside an inner
+    /// ClientHello (HPKE: X25519 + HKDF-SHA256 + ChaCha20Poly1305); the
+    /// outer hello shows the ECHConfig's `public_name`. Requires
+    /// `real_ech_config_hex`; the destination server must support ECH.
+    #[serde(default)]
+    pub enable_real_ech: bool,
+    /// Hex of the ECHConfigList — the `ech` SvcParamValue of the target's
+    /// DNS HTTPS record (e.g. from `dig HTTPS example.com`). Only read when
+    /// `enable_real_ech = true`.
+    #[serde(default)]
+    pub real_ech_config_hex: String,
     /// Fail-closed: if the fake ClientHello is not ACKed (injection not
     /// confirmed) within the wait window, the relay drops the connection so
     /// the real ClientHello is never sent. Default true.
@@ -414,6 +441,13 @@ impl Default for Settings {
             autottl_delta: 0,
             enable_http_host_tricks: false,
             enable_adaptive_desync: false,
+            // 2026 roadmap upgrades — all off by default: each one changes
+            // the wire shape, so they are opt-in like the other desync flags.
+            enable_frag_mid_sni: false,
+            enable_padding_inflation: false,
+            enable_strategy_rotation: false,
+            enable_real_ech: false,
+            real_ech_config_hex: String::new(),
             // MUST be true by default (fail-closed). If you flip this off, a
             // failed fake injection falls through to relaying the real
             // ClientHello, which defeats the whole point of the relay.
@@ -525,6 +559,17 @@ impl fmt::Debug for Settings {
             .field("autottl_delta", &self.autottl_delta)
             .field("enable_http_host_tricks", &self.enable_http_host_tricks)
             .field("enable_adaptive_desync", &self.enable_adaptive_desync)
+            .field("enable_frag_mid_sni", &self.enable_frag_mid_sni)
+            .field("enable_padding_inflation", &self.enable_padding_inflation)
+            .field(
+                "enable_strategy_rotation",
+                &self.enable_strategy_rotation,
+            )
+            .field("enable_real_ech", &self.enable_real_ech)
+            .field(
+                "real_ech_config_hex",
+                &format!("{} hex byte(s)", self.real_ech_config_hex.len() / 2),
+            )
             .field("relay_require_inject", &self.relay_require_inject)
             .finish()
     }
@@ -572,6 +617,15 @@ impl Settings {
 
     pub fn validate(&mut self) -> Result<(), DpiGuardError> {
         MutationProfile::from_str(&self.mutation_profile)?;
+        if self.enable_real_ech {
+            // Fail early on a broken ECH config: sealing fails per-hello
+            // otherwise, which would log-spam and silently disable ECH.
+            let bytes = crate::hpke::decode_hex(&self.real_ech_config_hex).map_err(|_| {
+                DpiGuardError::Config("real_ech_config_hex is not valid hex".into())
+            })?;
+            crate::ech::parse_ech_config_detailed(&bytes)
+                .map_err(|e| DpiGuardError::Config(format!("real_ech_config_hex: {e}")))?;
+        }
         if self.decoy_ttl == 0 || self.decoy_ttl > 64 {
             return Err(DpiGuardError::Config("decoy_ttl must be 1..=64".into()));
         }
@@ -1412,5 +1466,48 @@ mod tests {
         }
         assert_eq!(seen.unwrap().decoy_ttl, 2);
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// 2026 roadmap flags: off by default, parseable, and nested-cloak
+    /// profile accepted as a mutation_profile value.
+    #[test]
+    fn roadmap_2026_flags_default_off_and_parse() {
+        let s = Settings::default();
+        assert!(!s.enable_frag_mid_sni);
+        assert!(!s.enable_padding_inflation);
+        assert!(!s.enable_strategy_rotation);
+        assert!(!s.enable_real_ech);
+        let parsed = parse(
+            "enable_frag_mid_sni = true\n\
+             enable_padding_inflation = true\n\
+             enable_strategy_rotation = true\n\
+             mutation_profile = \"NestedCloak\"\n",
+        )
+        .unwrap();
+        assert!(parsed.enable_frag_mid_sni);
+        assert!(parsed.enable_padding_inflation);
+        assert!(parsed.enable_strategy_rotation);
+        assert_eq!(parsed.mutation_profile, "NestedCloak");
+    }
+
+    #[test]
+    fn real_ech_requires_valid_config_hex() {
+        // enable_real_ech with non-hex garbage is rejected at load.
+        let mut s = Settings {
+            enable_real_ech: true,
+            real_ech_config_hex: "zz".into(),
+            ..Settings::default()
+        };
+        assert!(s.validate().is_err());
+        // Valid hex that is not an ECHConfigList is rejected too.
+        let mut s = Settings {
+            enable_real_ech: true,
+            real_ech_config_hex: "0001020304".into(),
+            ..Settings::default()
+        };
+        assert!(s.validate().is_err());
+        // Flag off: nothing to validate.
+        let mut s = Settings::default();
+        assert!(s.validate().is_ok());
     }
 }

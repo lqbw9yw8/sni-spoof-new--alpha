@@ -33,6 +33,7 @@ pub mod fooling;
 pub mod fragmentation;
 pub mod geedge;
 pub mod handle_retire;
+pub mod hpke;
 pub mod http_host;
 pub mod integrity;
 pub mod native_gui;

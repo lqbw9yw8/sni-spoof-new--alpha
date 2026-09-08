@@ -142,6 +142,8 @@ pub fn append_port_suffix(sni: &[u8]) -> Vec<u8> {
 /// work. Aggressive is opt-in and *will* break many real servers.
 /// ChinaRegional/Henan are new 2025 profiles for regional firewalls that
 /// need combined TCP+TLS fragmentation (see Henan Firewall research).
+/// NestedCloak is the 2026 "Nested Extension Cloaking" profile: cover SNI
+/// + real name in a private-range extension + 3-segment TCP split.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MutationProfile {
     ChinaGfw,
@@ -150,16 +152,18 @@ pub enum MutationProfile {
     Aggressive,
     ChinaRegional,
     Henan,
+    NestedCloak,
 }
 
 impl MutationProfile {
-    pub const ALL: [MutationProfile; 6] = [
+    pub const ALL: [MutationProfile; 7] = [
         MutationProfile::Stealth,
         MutationProfile::ChinaGfw,
         MutationProfile::RussiaDpi,
         MutationProfile::Aggressive,
         MutationProfile::ChinaRegional,
         MutationProfile::Henan,
+        MutationProfile::NestedCloak,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -170,11 +174,14 @@ impl MutationProfile {
             MutationProfile::Aggressive => "Aggressive",
             MutationProfile::ChinaRegional => "ChinaRegional",
             MutationProfile::Henan => "Henan",
+            MutationProfile::NestedCloak => "NestedCloak",
         }
     }
 
     /// Case-only (and trailing-dot) mutations keep the same DNS identity
-    /// for cert / virtual-host matching.
+    /// for cert / virtual-host matching. NestedCloak has an empty mutation
+    /// chain (the visible SNI becomes the cover; the untouched real name
+    /// rides in the hidden extension), so it trivially preserves identity.
     pub fn preserves_identity(self) -> bool {
         matches!(
             self,
@@ -183,11 +190,13 @@ impl MutationProfile {
                 | MutationProfile::RussiaDpi
                 | MutationProfile::ChinaRegional
                 | MutationProfile::Henan
+                | MutationProfile::NestedCloak
         )
     }
 
     /// Recommended TCP chunk size for this profile (0 = no fragmentation)
     /// Henan/ChinaRegional need small chunks 24-32 to beat stateless parsers.
+    /// NestedCloak's pipeline overrides this with `min(32, len(real SNI))`.
     pub fn recommended_fragment_size(self) -> usize {
         match self {
             MutationProfile::Henan => 24,
@@ -196,6 +205,7 @@ impl MutationProfile {
             MutationProfile::ChinaGfw => 64,
             MutationProfile::RussiaDpi => 0, // Russia often doesn't need fragmentation
             MutationProfile::Aggressive => 32,
+            MutationProfile::NestedCloak => 32,
         }
     }
 
@@ -203,7 +213,10 @@ impl MutationProfile {
     pub fn uses_quic_bypass(self) -> bool {
         matches!(
             self,
-            MutationProfile::ChinaGfw | MutationProfile::ChinaRegional | MutationProfile::Henan
+            MutationProfile::ChinaGfw
+                | MutationProfile::ChinaRegional
+                | MutationProfile::Henan
+                | MutationProfile::NestedCloak
         )
     }
 
@@ -211,8 +224,18 @@ impl MutationProfile {
     pub fn uses_disorder(self) -> bool {
         matches!(
             self,
-            MutationProfile::ChinaRegional | MutationProfile::Henan | MutationProfile::Aggressive
+            MutationProfile::ChinaRegional
+                | MutationProfile::Henan
+                | MutationProfile::Aggressive
+                | MutationProfile::NestedCloak
         )
+    }
+
+    /// Whether this profile *requires* combined fragmentation even when the
+    /// operator has disabled `enable_combined_fragmentation`. NestedCloak's
+    /// whole evasion story is the cross-segment split, so it mandates it.
+    pub fn requires_combined_fragmentation(self) -> bool {
+        matches!(self, MutationProfile::NestedCloak)
     }
 }
 
@@ -226,8 +249,9 @@ impl FromStr for MutationProfile {
             "Aggressive" => Ok(MutationProfile::Aggressive),
             "ChinaRegional" => Ok(MutationProfile::ChinaRegional),
             "Henan" => Ok(MutationProfile::Henan),
+            "NestedCloak" => Ok(MutationProfile::NestedCloak),
             other => Err(crate::error::DpiGuardError::Config(format!(
-                "unknown mutation_profile {other:?}; expected Stealth, ChinaGfw, RussiaDpi, Aggressive, ChinaRegional, Henan"
+                "unknown mutation_profile {other:?}; expected Stealth, ChinaGfw, RussiaDpi, Aggressive, ChinaRegional, Henan, NestedCloak"
             ))),
         }
     }
@@ -248,6 +272,10 @@ pub fn get_mutation_profile(profile: MutationProfile) -> Vec<MutationFn> {
         // Regional: case + trailing dot - still identity-preserving but more entropy
         MutationProfile::ChinaRegional => vec![randomize_case_sni, add_trailing_dot],
         MutationProfile::Henan => vec![randomize_case_sni, add_trailing_dot],
+        // NestedCloak: no byte-level mutations at all. The visible SNI is
+        // replaced by the cover and the untouched real name is carried in
+        // the hidden extension, so mutating bytes here would be pointless.
+        MutationProfile::NestedCloak => vec![],
         MutationProfile::Aggressive => vec![
             inject_null_byte,
             explode_subdomains,
@@ -284,6 +312,33 @@ pub fn random_disguise_type() -> u16 {
     } else {
         rng.gen_range(SNI_DISGUISE_PRIVATE_RANGE.0..=SNI_DISGUISE_PRIVATE_RANGE.1)
     }
+}
+
+// --- Nested Extension Cloaking (2026) -------------------------------------
+
+/// Extension type that carries the real SNI inside a NestedCloak hello
+/// (private-use range; a cooperating endpoint knows to read it).
+pub const NESTED_HIDDEN_EXT_TYPE: u16 = 0xFF01;
+
+/// TCP chunk for the NestedCloak name split: `min(32, len(real name))`,
+/// never 0. Segment 2 carries exactly this many name bytes.
+pub fn nested_chunk_size(name_len: usize) -> usize {
+    name_len.clamp(1, 32)
+}
+
+/// Benign cover SNIs used by NestedCloak when `fronting_benign_sni` is not
+/// configured. These are large, "boring" destinations a DPI is unlikely to
+/// block; the operator's configured cover always wins.
+pub const NESTED_COVER_SNIS: [&str; 4] = [
+    "www.microsoft.com",
+    "www.apple.com",
+    "www.samsung.com",
+    "officecdn.microsoft.com",
+];
+
+pub fn random_nested_cover() -> String {
+    let mut rng = rand::thread_rng();
+    NESTED_COVER_SNIS[rng.gen_range(0..NESTED_COVER_SNIS.len())].to_string()
 }
 
 pub fn mutate_sni_full(sni: &[u8], profile: MutationProfile) -> Vec<u8> {
@@ -389,6 +444,52 @@ mod tests {
         );
         assert_eq!(get_mutation_profile(MutationProfile::Henan).len(), 2);
         assert!(get_mutation_profile(MutationProfile::Aggressive).len() >= 6);
+        // NestedCloak carries no byte-level mutations (empty chain).
+        assert_eq!(get_mutation_profile(MutationProfile::NestedCloak).len(), 0);
+        assert_eq!(MutationProfile::ALL.len(), 7);
+    }
+
+    #[test]
+    fn nested_cloak_profile_flags() {
+        assert_eq!(
+            MutationProfile::NestedCloak.recommended_fragment_size(),
+            32
+        );
+        assert!(MutationProfile::NestedCloak.uses_disorder());
+        assert!(MutationProfile::NestedCloak.uses_quic_bypass());
+        assert!(MutationProfile::NestedCloak.requires_combined_fragmentation());
+        assert!(MutationProfile::NestedCloak.preserves_identity());
+        // No other profile mandates combined fragmentation.
+        for p in MutationProfile::ALL {
+            if p != MutationProfile::NestedCloak {
+                assert!(!p.requires_combined_fragmentation());
+            }
+        }
+    }
+
+    #[test]
+    fn nested_chunk_size_is_min_32_len() {
+        assert_eq!(nested_chunk_size(0), 1);
+        assert_eq!(nested_chunk_size(1), 1);
+        assert_eq!(nested_chunk_size(18), 18);
+        assert_eq!(nested_chunk_size(32), 32);
+        assert_eq!(nested_chunk_size(200), 32);
+    }
+
+    #[test]
+    fn random_nested_cover_is_a_known_cover() {
+        for _ in 0..20 {
+            let cover = random_nested_cover();
+            assert!(NESTED_COVER_SNIS.contains(&cover.as_str()));
+        }
+    }
+
+    #[test]
+    fn nested_cloak_parses_from_str() {
+        assert_eq!(
+            MutationProfile::from_str("NestedCloak").unwrap(),
+            MutationProfile::NestedCloak
+        );
     }
 
     #[test]
