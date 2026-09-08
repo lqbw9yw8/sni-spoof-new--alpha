@@ -8,7 +8,13 @@
 # Xray/v2ray/sing-box core and no VPN: the destination IP is still visible
 # on the wire (that is inherent to SNI spoofing).
 
-# One of: "Stealth", "ChinaGfw", "RussiaDpi", "Aggressive", "ChinaRegional", "Henan".
+# One of: "Stealth", "ChinaGfw", "RussiaDpi", "Aggressive", "ChinaRegional",
+# "Henan", "NestedCloak".
+# NestedCloak = Nested Extension Cloaking (2026): the visible SNI becomes a
+# benign cover (fronting_benign_sni, or a random big-brand cover), the real
+# name rides inside a private-range extension (0xFF01), and the record is
+# cut into 3 TCP segments at the hidden extension boundary. It mandates
+# combined fragmentation, chunk = min(32, len(real SNI)), disorder ON.
 mutation_profile = "Stealth"
 
 # TTL for decoy packets (must reach the DPI, die before the origin).
@@ -58,6 +64,18 @@ enable_tls_record_fragmentation = false
 tls_record_chunk_size = 0          # 0 = use fragment_chunk_size
 # Split a TLS record immediately before the SNI name.
 enable_frag_by_sni = false
+# Split a TLS record *inside* the SNI name (mid-name straddle): no single
+# record contains the full hostname (2026 roadmap #1).
+enable_frag_mid_sni = false
+# Grow the ClientHello with a random-length TLS padding extension per
+# connection (RFC 7685): breaks fixed-size fingerprints and offset-based
+# SNI extractors (2026 roadmap #2).
+enable_padding_inflation = false
+# Per-connection strategy rotation + escalation (2026 roadmap #4 + #6):
+# weighted-random pick among techniques that already scored positively for a
+# domain, ladder-climb when the configured profile scores negative, and
+# score decay every 32 feedback events so old history fades.
+enable_strategy_rotation = false
 # Learn decoy TTL from the inbound hop count.
 enable_autottl = false
 autottl_delta = 0                  # 0..=32
@@ -80,7 +98,18 @@ fronting_benign_sni = ""
 enable_combined_fragmentation = true
 enable_utls_fingerprint = false
 utls_browser = "chrome"
+# Always-on ECH GREASE: every hello carries an extension of the *real* ECH
+# type (0xFE0D) with a random payload, so "has ECH / no ECH" classification
+# is useless. Servers that don't implement ECH ignore it.
 enable_ech_grease = false
+# Real ECH (2026 roadmap #5): seal the real SNI inside an inner
+# ClientHello; the outer hello shows the ECHConfig's public_name.
+# Requires the ECHConfigList of the destination — the `ech` SvcParamValue
+# of its DNS HTTPS record — as hex in real_ech_config_hex. Implemented
+# stack: DHKEM(X25519) + HKDF-SHA256 + ChaCha20Poly1305 (RFC 9180/8439).
+# The destination server must actually support ECH (e.g. behind Cloudflare).
+enable_real_ech = false
+real_ech_config_hex = ""
 enable_md5sig_fooling = false
 enable_geedge_evasion = true
 

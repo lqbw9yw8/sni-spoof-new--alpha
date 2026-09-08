@@ -508,7 +508,7 @@ procedure is printed at the end of that file.
 
 | File | Role | Status |
 |---|---|---|
-| `sni_mutations.rs` | 12+ SNI mutations + 6 profiles (Stealth, ChinaGfw, RussiaDpi, Aggressive, ChinaRegional, Henan) + SNI disguise GREASE/private | DONE |
+| `sni_mutations.rs` | 12+ SNI mutations + 7 profiles (Stealth, ChinaGfw, RussiaDpi, Aggressive, ChinaRegional, Henan, **NestedCloak**) + SNI disguise GREASE/private | DONE |
 | `fragmentation.rs` | TLS parse, SNI splice + length rewrite, TCP-level split + **disguise_sni_extension_type**, **front_sni_with_benign**, **inject_hidden_sni_in_unknown_ext** | DONE + NEW |
 | `packet.rs` | IPv4/IPv6 + TCP/UDP parse, checksums, segmentation, l3_slice | DONE |
 | `quic.rs` | **NEW**: QUIC Initial detection, port blindspot (src<=dst bypass per USENIX 2025), UDP src rewrite, decoy, QuicPortMapper | DONE + NEW |
@@ -524,7 +524,8 @@ procedure is printed at the end of that file.
 | `engine_stub.rs` | same signatures, PlatformNotSupported | DONE |
 | `config.rs` | TOML + validated fields + hot reload + new QUIC/fronting options | DONE + ENHANCED |
 | `integrity.rs` | SHA-256 pin compare (constant-time) | DONE |
-| `webui.rs` | opt-in 127.0.0.1 dashboard + 6 profiles | DONE + ENHANCED |
+| `hpke.rs` | **NEW 2026**: pure-Rust HPKE base mode for real ECH — X25519, HKDF-SHA256, ChaCha20Poly1305 (RFC 7748/5869/8439/9180 vectors) | DONE |
+| `webui.rs` | opt-in 127.0.0.1 dashboard + 7 profiles | DONE + ENHANCED |
 | `netguard.rs` | SSRF guards: forbidden dests/hostnames, DoH URL + relay IP validation | DONE |
 | `singleton.rs` | one-instance file lock next to the exe (flock/CreateFileW) | DONE |
 | `autottl.rs` | learn decoy TTL from inbound hop count | DONE |
@@ -537,6 +538,42 @@ procedure is printed at the end of that file.
 - **ChinaRegional / Henan**: case + trailing dot, 32/24-byte chunks, disorder_mode always ON, combined TCP+TLS fragmentation (persistent_fragmentation 16), TTL decoys. Targets Henan Firewall stateless parsing bug (IEEE S&P 2025).
 - **Stealth**: minimal, identity-preserving.
 - **Aggressive**: null-byte, explode, underscore, dots, overflow, port suffix + optional SNI disguise + fronting.
+- **NestedCloak** (2026): nested extension cloaking — visible SNI becomes a
+  benign cover (`fronting_benign_sni`), the real name travels intact inside
+  private extension `0xFF01`, and the ClientHello is emitted as exactly three
+  TCP segments `[cover] [ext header + 32 bytes of the name] [rest of the
+  name]` with `disorder_mode` ON and combined fragmentation forced. A DPI
+  that does not reassemble TCP streams ever sees only the cover.
+
+### 2026 roadmap upgrades (all opt-in, defaults unchanged)
+
+- **`enable_frag_mid_sni`** — TLS-record fragmentation that straddles the SNI:
+  the name is split across two well-formed `0x16` records; no single record
+  contains the full name (`fragmentation::tls_record_split_mid_sni`).
+- **`enable_padding_inflation`** — random 64–384-byte RFC 7685 padding per
+  connection to break fixed-size ClientHello fingerprints
+  (`geedge::inflate_padding_random`).
+- **`enable_ech_grease`** — always-on ECH-GREASE under the real type
+  `0xFE0D` (was GREASE `0x1201`), random 64–160-byte payload, so ECH
+  presence/absence cannot classify traffic (`ech::inject_ech_grease_fe0d`).
+- **`enable_strategy_rotation`** — per-connection weighted-random strategy
+  rotation among winning techniques (`strategy::select_rotating`), with
+  score decay every 32 feedback events and an escalation ladder
+  (Stealth → ChinaGfw → RussiaDpi → ChinaRegional → Henan → NestedCloak)
+  when the configured profile keeps losing.
+- **`enable_real_ech` + `real_ech_config_hex`** — real Encrypted Client
+  Hello: the inner ClientHello is HPKE-sealed with the server's ECHConfig
+  (DHKEM(X25519) + HKDF-SHA256 + ChaCha20Poly1305, suite `0x0001`,`0x0003`),
+  outer SNI becomes the config's `public_name` (`ech::seal_real_ech_hello`,
+  crypto in `hpke.rs`). The wire format follows the final standard
+  **RFC 9849** (extension `kdf|aead|config_id|enc|payload`; AAD = the outer
+  ClientHello body with the payload zeroed; `info = "tls ech\0" || ECHConfig`;
+  inner hello with empty session-id, inner marker `0xFE0D→0x01`, zero
+  padding to a multiple of 32), validated against the BoringSSL/NSS
+  reference behaviour and round-trip decrypt-tested. Requires a destination
+  server that actually supports ECH; paste the `ech=` SVCB octets as hex.
+  When armed it supersedes fronting/disguise/NestedCloak and must run last,
+  so the pipeline skips uTLS/Geedge/padding-inflation for that connection.
 
 ### QUIC blindspot (USENIX 2025 #1)
 
