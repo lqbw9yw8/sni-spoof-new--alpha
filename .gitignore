@@ -1,0 +1,14 @@
+# Rust build artifacts
+/target/
+
+# UI test dependencies
+uitest/node_modules/
+
+# Runtime files written next to the executable — never commit them.
+# The DNS cache can contain server IPs (see src/dns_cache.rs); the lock
+# file marks a running instance (see src/singleton.rs).
+dpi_guard.dns_cache
+dpi_guard.instance.lock
+
+# Operator's live config — only dpi_guard.toml.example is tracked.
+dpi_guard.toml
