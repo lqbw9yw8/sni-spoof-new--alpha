@@ -439,6 +439,7 @@ impl DpiGuardApp {
                 "Aggressive",
                 "ChinaRegional",
                 "Henan",
+                "NestedCloak",
             ],
         );
 

@@ -97,14 +97,14 @@ const countPair = (s, o, c) => { let d = 0; for (const ch of s) { if (ch === o) 
 
 console.log("\n[A] settings_keys() port");
 const { keys: realKeys, body: structBody } = settingsKeys();
-ok("77 Settings fields", realKeys.length === 77, "got " + realKeys.length);
+ok("82 Settings fields", realKeys.length === 82, "got " + realKeys.length);
 ok("no serde rename in the struct (field name == TOML key)", !/serde\(\s*rename/.test(structBody));
 ok("deny_unknown_fields is set", /#\[serde\(deny_unknown_fields\)\]/.test(CONFIG));
 ok("every key is a TOML identifier", realKeys.every((k) => /^[a-z][a-z0-9_]*$/.test(k)));
 
 console.log("\n[B] ui_schema_keys() port — the exact byte scan the Rust test uses");
 const uiKeys = uiSchemaKeys();
-ok("found 77 schema keys", uiKeys.length === 77, "got " + uiKeys.length);
+ok("found 82 schema keys", uiKeys.length === 82, "got " + uiKeys.length);
 const missing = realKeys.filter((k) => !uiKeys.includes(k));
 const bogus = uiKeys.filter((k) => !realKeys.includes(k));
 ok("every_settings_field_is_editable_in_the_ui", missing.length === 0, "missing=" + JSON.stringify(missing));

@@ -575,6 +575,129 @@ pub fn tls_record_split_before_sni(record: &[u8]) -> Result<Vec<Vec<u8>>, DpiGua
     Ok(vec![build(first_body), build(second_body)])
 }
 
+/// --- Nested Extension Cloaking (2026) ---
+/// Build the "cloaked" ClientHello for the `NestedCloak` profile: the
+/// visible SNI (type `0x0000`) becomes the benign `cover_sni`, and the real
+/// name rides inside a private-range extension (`hidden_type`, normally
+/// `sni_mutations::NESTED_HIDDEN_EXT_TYPE`) appended at the end of the
+/// extension list. The caller then cuts the wire at the hidden extension's
+/// boundary via [`nested_cloak_split_offsets`] so a DPI that does not
+/// reassemble TCP only ever sees the cover hello.
+pub fn nested_cloak(
+    record: &[u8],
+    cover_sni: &[u8],
+    real_sni: &[u8],
+    hidden_type: u16,
+) -> Result<Vec<u8>, DpiGuardError> {
+    if real_sni.is_empty() {
+        return Err(DpiGuardError::SniNotFound);
+    }
+    if cover_sni.is_empty() {
+        return Err(DpiGuardError::OutOfRange("empty cover SNI".into()));
+    }
+    let fronted = front_sni_with_benign(record, cover_sni)?;
+    inject_hidden_sni_in_unknown_ext(&fronted, real_sni, hidden_type)
+}
+
+/// TCP split points that give NestedCloak its classic 3-segment layout:
+///
+/// ```text
+/// seg1: everything before the hidden extension (cover SNI visible, 0x0000)
+/// seg2: hidden extension header (type+len) + first min(32, name_len) name bytes
+/// seg3: the rest of the name + the rest of the record
+/// ```
+///
+/// Returned offsets are payload-relative and feed straight into
+/// `packet::tcp_segment_payload_at_offsets`. Names shorter than 2 bytes
+/// collapse to 2 segments (nothing would be left for segment 3). A DPI that
+/// never reassembles TCP sees only seg1 — the cover.
+pub fn nested_cloak_split_offsets(
+    record: &[u8],
+    hidden_type: u16,
+) -> Result<Vec<usize>, DpiGuardError> {
+    let exts = list_extensions(record)?;
+    let hidden = exts
+        .iter()
+        .find(|e| e.ext_type == hidden_type)
+        .ok_or(DpiGuardError::SniNotFound)?;
+    // The hidden extension's body is the raw real name; the 4-byte
+    // type+length header sits just before `body_start`.
+    let header_start = hidden
+        .body_start
+        .checked_sub(4)
+        .ok_or_else(|| DpiGuardError::OutOfRange("hidden extension offset underflow".into()))?;
+    let body_len = hidden.body_end.saturating_sub(hidden.body_start);
+    let chunk = crate::sni_mutations::nested_chunk_size(body_len);
+    // Keep at least one name byte for segment 3 whenever possible.
+    let first_take = chunk.min(body_len.saturating_sub(1).max(1));
+    let mut offsets = vec![header_start];
+    let second = hidden.body_start.saturating_add(first_take);
+    if second > header_start && second < record.len() {
+        offsets.push(second);
+    }
+    Ok(offsets)
+}
+
+/// Split a complete TLS record into two valid `0x16` records *inside* the
+/// SNI hostname (after the first half of the name), so the name straddles
+/// the record boundary (2026 roadmap #1). Stateless DPIs that parse only
+/// the first record miss the name, and DPIs that anchor on a name at the
+/// *start* of the second record miss it too — no piece contains the full
+/// name. Falls back to [`tls_record_split_before_sni`] for 1-byte names
+/// (no middle to cut at).
+pub fn tls_record_split_mid_sni(record: &[u8]) -> Result<Vec<Vec<u8>>, DpiGuardError> {
+    let info = parse_client_hello(record)?;
+    let loc = info.sni.ok_or(DpiGuardError::SniNotFound)?;
+    let name_len = loc.name_end - loc.name_start;
+    if name_len < 2 {
+        return tls_record_split_before_sni(record);
+    }
+    let cut = loc.name_start + name_len / 2;
+    if cut <= 5 || cut >= record.len() {
+        return Err(DpiGuardError::OutOfRange(
+            "SNI offset outside record body".into(),
+        ));
+    }
+    let first_body = &record[5..cut];
+    let second_body = &record[cut..];
+    let version = [record[1], record[2]];
+    let build = |body: &[u8]| -> Vec<u8> {
+        let mut r = Vec::with_capacity(5 + body.len());
+        r.push(0x16);
+        r.extend_from_slice(&version);
+        r.extend_from_slice(&(body.len() as u16).to_be_bytes());
+        r.extend_from_slice(body);
+        r
+    };
+    Ok(vec![build(first_body), build(second_body)])
+}
+
+/// Remove the first extension of `ext_type` and patch every enclosing length
+/// field so the ClientHello stays structurally valid. Records without a
+/// matching extension are returned unchanged. Used by real ECH (the outer
+/// hello must not keep an ECH/GREASE extension once the sealed one is
+/// appended).
+pub fn remove_extension(record: &[u8], ext_type: u16) -> Result<Vec<u8>, DpiGuardError> {
+    let exts = list_extensions(record)?;
+    let target = match exts.iter().find(|e| e.ext_type == ext_type) {
+        Some(t) => t,
+        None => return Ok(record.to_vec()),
+    };
+    // First extension begins at extensions_len_off + 2, and its body starts
+    // 4 bytes after that (type + length header), so:
+    let extensions_len_off = exts[0].body_start - 6;
+    let start = target.body_start - 4; // includes the type+len header
+    let end = target.body_end;
+    let delta = (end - start) as i32;
+    let mut out = Vec::with_capacity(record.len().saturating_sub(delta.max(0) as usize));
+    out.extend_from_slice(&record[..start]);
+    out.extend_from_slice(&record[end..]);
+    patch_u16(&mut out, 3, -delta); // record length
+    patch_u24(&mut out, 6, -delta); // handshake length
+    patch_u16(&mut out, extensions_len_off, -delta);
+    Ok(out)
+}
+
 /// Test helper: a structurally valid ClientHello whose SNI is `sni`.
 pub fn encode_client_hello(sni: &str) -> Vec<u8> {
     let mut ext_body = Vec::new();
@@ -806,5 +929,133 @@ mod tests {
         let exts = list_extensions(&with).unwrap();
         let sg = exts.iter().find(|e| e.ext_type == 0x000A).unwrap();
         assert_eq!(&with[sg.body_start..sg.body_end], body.as_slice());
+    }
+
+    #[test]
+    fn nested_cloak_cover_visible_and_real_hidden() {
+        let record = encode_client_hello("secret.example.com");
+        let cloaked = nested_cloak(&record, b"www.microsoft.com", b"secret.example.com", 0xFF01)
+            .unwrap();
+        // Cover is the visible 0x0000 SNI.
+        let (s, e) = calculate_smart_split_points(&cloaked).unwrap();
+        assert_eq!(&cloaked[s..e], b"www.microsoft.com");
+        // Real name rides inside the private-range extension.
+        let exts = list_extensions(&cloaked).unwrap();
+        let hidden = exts.iter().find(|x| x.ext_type == 0xFF01).unwrap();
+        assert_eq!(&cloaked[hidden.body_start..hidden.body_end], b"secret.example.com");
+        // All length fields still add up.
+        let rec_len = u16::from_be_bytes([cloaked[3], cloaked[4]]) as usize;
+        assert_eq!(5 + rec_len, cloaked.len());
+    }
+
+    #[test]
+    fn nested_cloak_three_segment_split() {
+        let record = encode_client_hello("secret.example.com"); // 18-byte name
+        let cloaked = nested_cloak(&record, b"www.microsoft.com", b"secret.example.com", 0xFF01)
+            .unwrap();
+        let offsets = nested_cloak_split_offsets(&cloaked, 0xFF01).unwrap();
+        assert_eq!(offsets.len(), 2, "expected 3 segments");
+        // seg2 = 4-byte extension header + all-but-one name bytes (the last
+        // byte is deliberately held back so segment 3 is never empty).
+        assert_eq!(offsets[1], offsets[0] + 4 + 17);
+        // seg1 must contain the cover but not the real name.
+        assert!(cloaked[..offsets[0]].windows(17).any(|w| w == b"www.microsoft.com"));
+        assert!(!cloaked[..offsets[0]].windows(6).any(|w| w == b"secret"));
+        // seg2 starts with the hidden extension type, then the name prefix.
+        assert_eq!(&cloaked[offsets[0]..offsets[0] + 2], &0xFF01u16.to_be_bytes());
+        assert_eq!(&cloaked[offsets[0] + 4..offsets[1]], b"secret.example.co");
+        // seg3 carries exactly the final name byte.
+        assert_eq!(&cloaked[offsets[1]..], b"m");
+    }
+
+    #[test]
+    fn nested_cloak_long_name_splits_mid_name() {
+        let long = "a-very-long-target-hostname.example.com"; // > 32 bytes
+        let record = encode_client_hello(long);
+        let cloaked = nested_cloak(&record, b"www.apple.com", long.as_bytes(), 0xFF01).unwrap();
+        let offsets = nested_cloak_split_offsets(&cloaked, 0xFF01).unwrap();
+        assert_eq!(offsets.len(), 2);
+        // Only the first 32 name bytes ride in seg2; seg3 carries the rest.
+        assert_eq!(offsets[1], offsets[0] + 4 + 32);
+        assert!(offsets[1] < cloaked.len());
+        let seg3 = &cloaked[offsets[1]..];
+        assert_eq!(seg3.len(), long.len() - 32);
+    }
+
+    #[test]
+    fn nested_cloak_one_byte_name_collapses_to_two_segments() {
+        let record = encode_client_hello("x.io");
+        // Hand-craft a record with a 1-byte name so seg3 would be empty.
+        let small = splice_sni(&record, b"y").unwrap();
+        let cloaked = nested_cloak(&small, b"www.microsoft.com", b"y", 0xFF01).unwrap();
+        let offsets = nested_cloak_split_offsets(&cloaked, 0xFF01).unwrap();
+        assert_eq!(offsets.len(), 1, "1-byte name cannot fill 3 segments");
+    }
+
+    #[test]
+    fn nested_cloak_rejects_empty_inputs() {
+        let record = encode_client_hello("example.com");
+        assert!(nested_cloak(&record, b"cover.com", b"", 0xFF01).is_err());
+        assert!(nested_cloak(&record, b"", b"example.com", 0xFF01).is_err());
+        // No hidden extension of that type -> no split points.
+        assert!(nested_cloak_split_offsets(&record, 0xFF01).is_err());
+    }
+
+    #[test]
+    fn tls_split_mid_sni_straddles_the_name() {
+        let record = encode_client_hello("example.com");
+        let parts = tls_record_split_mid_sni(&record).unwrap();
+        assert_eq!(parts.len(), 2);
+        for r in &parts {
+            assert_eq!(r[0], 0x16);
+            let len = u16::from_be_bytes([r[3], r[4]]) as usize;
+            assert_eq!(5 + len, r.len());
+        }
+        // Neither piece contains the full name.
+        assert!(!parts[0].windows(11).any(|w| w == b"example.com"));
+        assert!(!parts[1].windows(11).any(|w| w == b"example.com"));
+        // First piece ends mid-name ("exampl"), second starts with "e.com".
+        assert!(parts[0].windows(6).any(|w| w == b"exampl"));
+        assert!(parts[1].windows(5).any(|w| w == b"e.com"));
+        // Reassembled handshake bodies equal the original body.
+        let rejoined: Vec<u8> = parts.iter().flat_map(|r| r[5..].iter().copied()).collect();
+        assert_eq!(rejoined, record[5..].to_vec());
+    }
+
+    #[test]
+    fn tls_split_mid_sni_one_byte_name_falls_back() {
+        let record = encode_client_hello("example.com");
+        let small = splice_sni(&record, b"y").unwrap();
+        let parts = tls_record_split_mid_sni(&small).unwrap();
+        assert_eq!(parts.len(), 2);
+        // Fallback = split *before* the name; name wholly in the second part.
+        assert!(parts[1].windows(1).any(|w| w == b"y"));
+        assert!(!parts[0].windows(1).any(|w| w == b"y"));
+    }
+
+    #[test]
+    fn remove_extension_patches_lengths() {
+        let record = encode_client_hello("benign.example");
+        let with_hidden =
+            inject_hidden_sni_in_unknown_ext(&record, b"real.example.com", 0xFF01).unwrap();
+        assert_eq!(list_extensions(&with_hidden).unwrap().len(), 2);
+        let stripped = remove_extension(&with_hidden, 0xFF01).unwrap();
+        // Back to a single SNI extension, real name gone, cover intact.
+        let exts = list_extensions(&stripped).unwrap();
+        assert_eq!(exts.len(), 1);
+        assert_eq!(exts[0].ext_type, 0x0000);
+        assert!(!stripped.windows(16).any(|w| w == b"real.example.com"));
+        let (s, e) = calculate_smart_split_points(&stripped).unwrap();
+        assert_eq!(&stripped[s..e], b"benign.example");
+        let rec_len = u16::from_be_bytes([stripped[3], stripped[4]]) as usize;
+        assert_eq!(5 + rec_len, stripped.len());
+        assert_eq!(stripped.len(), record.len());
+    }
+
+    #[test]
+    fn remove_extension_is_noop_when_absent() {
+        let record = encode_client_hello("example.com");
+        let same = remove_extension(&record, 0xFF01).unwrap();
+        assert_eq!(same, record);
     }
 }
